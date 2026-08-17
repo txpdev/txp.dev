@@ -1,59 +1,159 @@
-import vinext from "vinext";
+import type { Plugin } from "vite";
 import { defineConfig } from "vite";
-import hostingConfig from "./.openai/hosting.json";
-import { sites } from "./build/sites-vite-plugin";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import viteReact from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { nitro } from "nitro/vite";
+// @ts-expect-error JS plugin alongside the TS vite config
+import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
 
-const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
-  "00000000-0000-4000-8000-000000000000";
-
-const { d1, r2 } = hostingConfig;
-
-// macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
-const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
-
-const localBindingConfig = {
-  main: "./worker/index.ts",
-  compatibility_flags: ["nodejs_compat"],
-  d1_databases: d1
-    ? [
-        {
-          binding: d1,
-          database_name: "site-creator-d1",
-          database_id: SITE_CREATOR_PLACEHOLDER_DATABASE_ID,
-        },
-      ]
-    : [],
-  r2_buckets: r2
-    ? [
-        {
-          binding: r2,
-          bucket_name: "site-creator-r2",
-        },
-      ]
-    : [],
-};
-
-export default defineConfig(async () => {
-  // Keep Wrangler and Miniflare state project-local. These are non-secret tool
-  // settings; application environment belongs in ignored `.env*` files.
-  process.env.WRANGLER_WRITE_LOGS ??= "false";
-  process.env.WRANGLER_LOG_PATH ??= ".wrangler/logs";
-  process.env.MINIFLARE_REGISTRY_PATH ??= ".wrangler/registry";
-
-  // Wrangler snapshots its log path while the Cloudflare plugin is imported.
-  const { cloudflare } = await import("@cloudflare/vite-plugin");
-
+/**
+ * Finish PGLite bootstrap during dev-server setup (before traffic). Vite awaits
+ * async `configureServer` hooks. Production: `src/lib/db` kicks `ensureDbReady`
+ * on import.
+ */
+function pgliteBootstrapPlugin(): Plugin {
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
-    plugins: [
-      vinext(),
-      sites(),
-      cloudflare({
-        viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        config: localBindingConfig,
-      }),
-    ],
+    name: "app-builder:pglite-bootstrap",
+    apply: "serve",
+    async configureServer(server) {
+      try {
+        const mod = (await server.ssrLoadModule("/src/lib/db.ts")) as {
+          ensureDbReady?: () => Promise<void>;
+        };
+        if (typeof mod.ensureDbReady === "function") {
+          await mod.ensureDbReady();
+        }
+      } catch (err) {
+        console.error("[app-builder] DB bootstrap failed:", err);
+        throw err;
+      }
+    },
   };
-});
+}
+
+/**
+ * Live-preview OAuth popup — handled HERE so the agent never has to create a
+ * `/auth/popup` route (and cannot break it by scaffolding a React page that
+ * paints the full app shell in the popup).
+ *
+ * `signIn` (client.ts) opens `/auth/popup?providerId=…` in a top-level window.
+ * This middleware runs before TanStack Start, calls `handleAuthPopupRequest`,
+ * and returns the 302 / completion HTML. Deployed apps do not use the popup
+ * (full-page OAuth redirect), so `apply: "serve"` is enough.
+ */
+function authPopupPlugin(): Plugin {
+  return {
+    name: "app-builder:auth-popup",
+    apply: "serve",
+    configureServer(server) {
+      // Register immediately (not in a returned post-hook) so we run BEFORE
+      // TanStack Start / the SPA HTML fallback. A model-authored
+      // `src/routes/auth/popup.tsx` React page must never win this path.
+      server.middlewares.use(async (req, res, next) => {
+        try {
+          const rawUrl = req.url ?? "";
+          const pathOnly = rawUrl.split("?", 1)[0] ?? "";
+          if (pathOnly !== "/auth/popup") {
+            next();
+            return;
+          }
+          if ((req.method ?? "GET").toUpperCase() !== "GET") {
+            res.statusCode = 405;
+            res.setHeader("content-type", "text/plain; charset=utf-8");
+            res.end("Method Not Allowed");
+            return;
+          }
+
+          const host = String(
+            req.headers["x-forwarded-host"] ?? req.headers.host ?? "localhost:8080",
+          );
+          const proto = String(
+            req.headers["x-forwarded-proto"] ??
+              ((req.socket as { encrypted?: boolean } | undefined)?.encrypted ? "https" : "http"),
+          );
+          const requestHeaders = new Headers();
+          for (const [key, value] of Object.entries(req.headers)) {
+            if (value === undefined) continue;
+            if (Array.isArray(value)) {
+              for (const v of value) requestHeaders.append(key, v);
+            } else {
+              requestHeaders.set(key, value);
+            }
+          }
+          // Ensure Host is the public preview host so Better Auth's dynamic
+          // baseURL / redirect_uri match the popup origin.
+          if (!requestHeaders.has("host")) requestHeaders.set("host", host);
+
+          const request = new Request(`${proto}://${host}${rawUrl}`, {
+            method: "GET",
+            headers: requestHeaders,
+          });
+
+          const mod = (await server.ssrLoadModule("/src/lib/auth/popup.server.ts")) as {
+            handleAuthPopupRequest: (req: Request) => Promise<Response>;
+          };
+          const response = await mod.handleAuthPopupRequest(request);
+
+          res.statusCode = response.status;
+          // Preserve multiple Set-Cookie headers (OAuth state + session).
+          const setCookies =
+            typeof response.headers.getSetCookie === "function"
+              ? response.headers.getSetCookie()
+              : [];
+          response.headers.forEach((value, key) => {
+            if (key.toLowerCase() === "set-cookie") return;
+            res.setHeader(key, value);
+          });
+          for (const cookie of setCookies) {
+            res.appendHeader("set-cookie", cookie);
+          }
+          const body = Buffer.from(await response.arrayBuffer());
+          res.end(body);
+        } catch (err) {
+          console.error("[app-builder] /auth/popup handler failed:", err);
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader("content-type", "text/plain; charset=utf-8");
+            res.end("auth popup failed");
+          }
+        }
+      });
+    },
+  };
+}
+
+// `0.0.0.0:8080` is the live-preview contract — don't change host/port.
+// Keep `nitro` gated to `build` (the Vercel deploy target): enabled in dev it
+// opens a second dev-server port, which breaks the single-port preview.
+// The dev server starts once `src/router.tsx` and `src/routes/` exist — see
+// AGENTS.md § "First scaffold".
+export default defineConfig(({ command }) => ({
+  server: {
+    host: "0.0.0.0",
+    port: 8080,
+    strictPort: true,
+  },
+  resolve: { tsconfigPaths: true },
+  plugins: [
+    pgliteBootstrapPlugin(),
+    // Before tanstackStart so /auth/popup never falls through to the SPA.
+    authPopupPlugin(),
+    // PWA head + ?install=1 tutorial page; runs before Start/Nitro.
+    grokPwaPlugin(),
+    tailwindcss(),
+    tanstackStart(),
+    ...(command === "build"
+      ? [
+          nitro({
+            preset: "vercel",
+            // Auto-registers server/middleware/* (the PWA install page +
+            // manifest + head-tag middleware). Nitro v3 defaults serverDir to
+            // false, so removing this silently unwires /?install=1 on deploys.
+            serverDir: "./server",
+          }),
+        ]
+      : []),
+    viteReact(),
+  ],
+}));

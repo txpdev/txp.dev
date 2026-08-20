@@ -453,7 +453,8 @@ a.project-row:focus-visible {
 .project-row h2 {
   min-width: 0;
   margin: clamp(16px, 2vh, 22px) 0 7px;
-  overflow-wrap: break-word;
+  overflow-wrap: normal;
+  word-break: normal;
   font-family: var(--font-berkeley);
   font-size: clamp(18px, 1.7vw, 26px);
   font-weight: 600;
@@ -462,7 +463,7 @@ a.project-row:focus-visible {
 }
 
 .project-row:last-child h2 {
-  overflow-wrap: break-word;
+  overflow-wrap: normal;
   font-size: clamp(16px, 1.45vw, 22px);
   letter-spacing: -0.045em;
   white-space: normal;

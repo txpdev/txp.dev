@@ -43,7 +43,7 @@ export const projects = [
   },
   {
     number: "04",
-    name: "ConvNetQuake",
+    name: "ConvNet\u200bQuake",
     category: "Earthquake science",
     role: "Research",
     outcome: "Open source",

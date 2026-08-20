@@ -4,10 +4,10 @@
     x="16"
     y="21"
     text-anchor="middle"
-    font-family="Georgia, 'Times New Roman', serif"
-    font-size="11"
+    font-family="'Berkeley Mono', 'IBM Plex Mono', ui-monospace, monospace"
+    font-size="10"
     font-weight="700"
-    letter-spacing="-0.06em"
+    letter-spacing="-0.04em"
     fill="#efeee6"
   >TXP</text>
 </svg>
